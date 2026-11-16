@@ -1,0 +1,1101 @@
+{
+  "name": "Renewal Forecast - Contract Expiration Radar",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "f2c6636e-67a6-58c9-80b9-11a4cedc674f",
+      "name": "Daily 08:00 UTC Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "e9a23adc-44b1-54e0-81b7-a498ab2c1ef3",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Config & Safety Gate\n// Reads every setting from environment variables, validates it and\n// computes the effective safety gate. Secrets are NEVER copied into the\n// execution data: only \"is it set?\" booleans leave this node.\n// Anything missing, unreadable or invalid falls back to the SAFE default.\n// =====================================================================\nlet envAccessBlocked = false;\nconst gateWarnings = [];\nconst configErrors = [];\nconst gateReasons = [];\n\nconst readEnv = (key) => {\n  try {\n    const v = $env[key];\n    if (v === undefined || v === null) return undefined;\n    const s = String(v).trim();\n    return s === '' ? undefined : s;\n  } catch (e) {\n    envAccessBlocked = true;\n    return undefined;\n  }\n};\nconst isSet = (key) => readEnv(key) !== undefined;\nconst bool = (key, safeDefault) => {\n  const v = readEnv(key);\n  if (v === undefined) return safeDefault;\n  const s = v.toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(s)) return true;\n  if (['false', '0', 'no', 'off'].includes(s)) return false;\n  gateWarnings.push(`${key}=\"${v}\" is not a boolean; using safe default ${safeDefault}.`);\n  return safeDefault;\n};\nconst num = (key, def, min, max) => {\n  const v = readEnv(key);\n  if (v === undefined) return def;\n  const n = Number(v);\n  if (!Number.isFinite(n) || n < min || n > max) {\n    gateWarnings.push(`${key}=\"${v}\" is outside [${min}, ${max}]; using default ${def}.`);\n    return def;\n  }\n  return n;\n};\nconst str = (key, def) => readEnv(key) ?? def;\nconst list = (key, def) => (readEnv(key) ?? def).split(',').map((s) => s.trim()).filter(Boolean);\n\n// ---- Safety flags (safe by default) --------------------------------\nconst requestedSandbox = bool('SANDBOX_MODE', true);\nconst requestedDryRun = bool('DRY_RUN', true);\nconst creationEnabled = bool('RENEWAL_DEALS_CREATION_ENABLED', false);\nconst stageUpdatesEnabled = bool('RENEWAL_STAGE_UPDATES_ENABLED', false);\nconst writebackEnabled = bool('MILESTONE_WRITEBACK_ENABLED', false);\nconst sendSlackAlerts = bool('SEND_SLACK_ALERTS', false);\nconst sendWebhookAlerts = bool('SEND_WEBHOOK_ALERTS', false);\n\n// ---- Secret presence checks (values never output) ------------------\nconst hasHubspotToken = isSet('HUBSPOT_ACCESS_TOKEN');\nconst slackUrl = readEnv('SLACK_RENEWAL_WEBHOOK_URL');\nconst webhookUrl = readEnv('ALERT_WEBHOOK_URL');\nconst hasSlackWebhook = Boolean(slackUrl) && /^https:\\/\\//i.test(slackUrl);\nconst hasAlertWebhook = Boolean(webhookUrl) && /^https:\\/\\//i.test(webhookUrl);\nif (slackUrl && !hasSlackWebhook) gateWarnings.push('SLACK_RENEWAL_WEBHOOK_URL must start with https:// \u2014 Slack alerts disabled.');\nif (webhookUrl && !hasAlertWebhook) gateWarnings.push('ALERT_WEBHOOK_URL must start with https:// \u2014 webhook alerts disabled.');\n\n// ---- HubSpot mapping (non-secret) ----------------------------------\nconst hubspot = {\n  apiBaseUrl: str('HUBSPOT_API_BASE_URL', 'https://api.hubapi.com').replace(/\\/+$/, ''),\n  portalId: str('HUBSPOT_PORTAL_ID', '99000001'),\n  sourcePipelineId: str('HUBSPOT_SOURCE_PIPELINE_ID', 'default'),\n  sourceWonStageIds: list('HUBSPOT_SOURCE_CLOSED_WON_STAGE_IDS', 'closedwon'),\n  renewalPipelineId: str('HUBSPOT_RENEWAL_PIPELINE_ID', '880001'),\n  stageMap: {\n    90: str('RENEWAL_STAGE_90_ID', '880001-identified'),\n    60: str('RENEWAL_STAGE_60_ID', '880001-proposal'),\n    30: str('RENEWAL_STAGE_30_ID', '880001-commit'),\n  },\n  renewalClosedStageIds: list('HUBSPOT_RENEWAL_CLOSED_STAGE_IDS', '880001-won,880001-lost'),\n  associationTypeId: num('HUBSPOT_DEAL_COMPANY_ASSOCIATION_TYPE_ID', 5, 1, 100000),\n  fallbackOwnerId: str('RENEWAL_FALLBACK_OWNER_ID', '70000099'),\n  props: {\n    contractEndDate: str('HUBSPOT_CONTRACT_END_DATE_PROPERTY', 'contract_end_date'),\n    arr: str('HUBSPOT_ARR_PROPERTY', 'arr'),\n    renewalSourceDealId: str('HUBSPOT_RENEWAL_SOURCE_PROPERTY', 'renewal_source_deal_id'),\n    renewalKey: str('HUBSPOT_RENEWAL_KEY_PROPERTY', 'renewal_idempotency_key'),\n    lastMilestone: str('HUBSPOT_LAST_MILESTONE_PROPERTY', 'renewal_radar_last_milestone'),\n    companyTier: str('HUBSPOT_COMPANY_TIER_PROPERTY', 'customer_tier'),\n  },\n  maxPages: num('HUBSPOT_MAX_SEARCH_PAGES', 50, 1, 100),\n};\n\n// ---- Radar rules ---------------------------------------------------\nconst windows = [...new Set(list('RENEWAL_WINDOWS_DAYS', '90,60,30').map(Number))]\n  .filter((n) => Number.isInteger(n) && n > 0 && n <= 365)\n  .sort((a, b) => b - a);\nif (!windows.length) configErrors.push('RENEWAL_WINDOWS_DAYS must contain at least one whole number of days between 1 and 365.');\nfor (const w of windows) {\n  if (!hubspot.stageMap[w]) {\n    const v = readEnv(`RENEWAL_STAGE_${w}_ID`);\n    if (v) hubspot.stageMap[w] = v;\n    else configErrors.push(`Window ${w}d has no stage mapping \u2014 set RENEWAL_STAGE_${w}_ID.`);\n  }\n}\nconst requestedCatchup = num('WINDOW_CATCHUP_DAYS', 2, 0, 14);\nconst catchupDays = writebackEnabled ? requestedCatchup : 0;\nif (!writebackEnabled && requestedCatchup > 0) gateWarnings.push('MILESTONE_WRITEBACK_ENABLED=false \u2014 catch-up disabled (exact-day milestones only) so no alert repeats.');\n\nconst refEnv = readEnv('RADAR_REFERENCE_DATE');\nlet referenceDate = new Date().toISOString().slice(0, 10);\nlet referenceDateSource = 'today_utc';\nif (refEnv) {\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(refEnv) && !Number.isNaN(Date.parse(`${refEnv}T00:00:00Z`))) { referenceDate = refEnv; referenceDateSource = 'RADAR_REFERENCE_DATE'; }\n  else gateWarnings.push(`RADAR_REFERENCE_DATE=\"${refEnv}\" is not YYYY-MM-DD; using today (UTC).`);\n}\n\nconst radar = {\n  windows,\n  catchupDays,\n  provisionWithinDays: windows.length ? windows[0] : 90,\n  referenceDate,\n  referenceDateSource,\n  enterpriseMinArr: num('ENTERPRISE_MIN_ARR', 50000, 0, 1e12),\n  enterpriseTierValues: list('ENTERPRISE_TIER_VALUES', 'Enterprise,Strategic').map((s) => s.toLowerCase()),\n  associationMatchToleranceDays: num('RENEWAL_MATCH_TOLERANCE_DAYS', 45, 0, 365),\n  upliftPct: num('RENEWAL_UPLIFT_PCT', 0, -100, 500),\n  dealNameTemplate: str('RENEWAL_DEAL_NAME_TEMPLATE', '{company_name} - Renewal {contract_end_year}'),\n  currency: str('RENEWAL_CURRENCY', 'USD'),\n};\n\nconst limits = {\n  maxRenewalDealsPerRun: num('MAX_RENEWAL_DEALS_PER_RUN', 25, 1, 1000),\n  circuitBreakerMaxProposed: num('CIRCUIT_BREAKER_MAX_PROPOSED_DEALS', 75, 1, 10000),\n  circuitBreakerInvalidDatePct: num('CIRCUIT_BREAKER_INVALID_DATE_PCT', 20, 1, 100),\n  batchSize: num('HUBSPOT_BATCH_SIZE', 100, 1, 100),\n};\n\nconst alerts = {\n  minSeverity: str('ALERT_MIN_SEVERITY', 'WARNING').toUpperCase(),\n  maxItemsPerSection: num('ALERT_MAX_ITEMS_PER_SECTION', 10, 1, 25),\n};\nif (!['INFO', 'WARNING', 'CRITICAL'].includes(alerts.minSeverity)) { gateWarnings.push(`ALERT_MIN_SEVERITY=\"${alerts.minSeverity}\" is invalid; using WARNING.`); alerts.minSeverity = 'WARNING'; }\n\n// ---- Effective safety gate -----------------------------------------\nlet sandboxMode = requestedSandbox;\nif (envAccessBlocked) gateReasons.push('Environment access is blocked in this n8n instance (N8N_BLOCK_ENV_ACCESS_IN_NODE). All settings fell back to safe defaults.');\nif (!sandboxMode && !hasHubspotToken) { sandboxMode = true; gateReasons.push('SANDBOX_MODE=false but HUBSPOT_ACCESS_TOKEN is not set \u2014 forced back to sandbox.'); }\nif (!sandboxMode && !/^https:\\/\\//i.test(hubspot.apiBaseUrl)) { sandboxMode = true; gateReasons.push('HUBSPOT_API_BASE_URL must use https:// \u2014 forced back to sandbox.'); }\n\n// Live writes need the renewal pipeline and stages set explicitly (never the mock defaults).\nconst mappingExplicit = isSet('HUBSPOT_RENEWAL_PIPELINE_ID') && windows.every((w) => isSet(`RENEWAL_STAGE_${w}_ID`)) && isSet('HUBSPOT_PORTAL_ID');\nif (!sandboxMode && !mappingExplicit) gateReasons.push('Renewal pipeline, stage IDs or portal ID still use mock defaults \u2014 live writes disabled until HUBSPOT_RENEWAL_PIPELINE_ID, HUBSPOT_PORTAL_ID and RENEWAL_STAGE_<window>_ID are set.');\nif (configErrors.length) gateReasons.push(`Configuration errors found (${configErrors.length}) \u2014 live writes disabled.`);\n\nconst dryRun = requestedDryRun || sandboxMode;\nconst writesBase = !sandboxMode && !requestedDryRun && mappingExplicit && configErrors.length === 0;\nconst permissions = {\n  createRenewalDeals: writesBase && creationEnabled,\n  updateRenewalStages: writesBase && stageUpdatesEnabled,\n  milestoneWriteback: writesBase && writebackEnabled,\n};\nif (sandboxMode) gateReasons.push('SANDBOX_MODE=true \u2014 mock fixture data, zero network calls.');\nif (requestedDryRun) gateReasons.push('DRY_RUN=true \u2014 no writes to HubSpot.');\nif (!creationEnabled) gateReasons.push('RENEWAL_DEALS_CREATION_ENABLED=false \u2014 renewal deals are previewed only.');\n\nconst slackAlertsPermitted = sendSlackAlerts && !sandboxMode && hasSlackWebhook;\nconst webhookAlertsPermitted = sendWebhookAlerts && !sandboxMode && hasAlertWebhook;\n\n// ---- Live search bodies (non-secret) -------------------------------\nconst DAY = 86400000;\nconst refMs = Date.parse(`${referenceDate}T00:00:00Z`);\nconst searchHorizonDays = radar.provisionWithinDays + 1;\nconst dealProps = ['dealname', 'pipeline', 'dealstage', 'amount', 'closedate', 'hubspot_owner_id', hubspot.props.contractEndDate, hubspot.props.arr, hubspot.props.lastMilestone];\nconst live = {\n  searchExpiringBody: {\n    filterGroups: [{\n      filters: [\n        { propertyName: hubspot.props.contractEndDate, operator: 'BETWEEN', value: String(refMs), highValue: String(refMs + searchHorizonDays * DAY) },\n        { propertyName: 'pipeline', operator: 'EQ', value: hubspot.sourcePipelineId },\n        { propertyName: 'dealstage', operator: 'IN', values: hubspot.sourceWonStageIds },\n      ],\n    }],\n    properties: [...new Set(dealProps)],\n    sorts: [{ propertyName: hubspot.props.contractEndDate, direction: 'ASCENDING' }],\n    limit: 100,\n  },\n  searchRenewalsBody: {\n    filterGroups: [{\n      filters: [\n        { propertyName: 'pipeline', operator: 'EQ', value: hubspot.renewalPipelineId },\n        { propertyName: 'closedate', operator: 'GTE', value: String(refMs - 30 * DAY) },\n      ],\n    }],\n    properties: ['dealname', 'pipeline', 'dealstage', 'amount', 'closedate', 'hubspot_owner_id', hubspot.props.contractEndDate, hubspot.props.renewalSourceDealId, hubspot.props.renewalKey],\n    limit: 100,\n  },\n  companyProperties: ['name', 'domain', hubspot.props.companyTier],\n};\n\n// ---- Run metadata --------------------------------------------------\nconst startedAt = new Date().toISOString();\nlet trigger = 'manual';\ntry { if ($('Daily 08:00 UTC Schedule').isExecuted) trigger = 'schedule'; } catch (e) { /* manual */ }\nconst runId = `renewal-radar-${startedAt.slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 8)}`;\nconst anyWrite = Object.values(permissions).some(Boolean);\nconst mode = sandboxMode ? 'SANDBOX' : anyWrite ? 'LIVE' : 'DRY_RUN';\n\nreturn [{\n  json: {\n    runId,\n    startedAt,\n    trigger,\n    workflow: 'n8n-renewal-forecast-contract-expiration-radar',\n    workflowVersion: '1.0.0',\n    config: { hubspot, radar, limits, alerts, live },\n    gate: {\n      mode,\n      sandboxMode,\n      dryRun,\n      requested: { sandboxMode: requestedSandbox, dryRun: requestedDryRun, creationEnabled, stageUpdatesEnabled, writebackEnabled, sendSlackAlerts, sendWebhookAlerts },\n      permissions,\n      mappingExplicit,\n      slackAlertsPermitted,\n      webhookAlertsPermitted,\n      secretsPresent: { hubspotAccessToken: hasHubspotToken, slackWebhook: hasSlackWebhook, alertWebhook: hasAlertWebhook },\n      envAccessBlocked,\n      reasons: gateReasons,\n      warnings: gateWarnings,\n      configErrors,\n    },\n  },\n}];\n"
+      },
+      "id": "1fb24864-97f1-5713-a550-f6b7818cb7ac",
+      "name": "Config & Safety Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "a821f9c2-b5c5-51bb-959a-d2e6578d81b1",
+              "leftValue": "={{ $json.gate.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6fe58634-f1a4-5561-ad03-a3cedb51e602",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Load Mock Fixture (SANDBOX_MODE)\n// Synthetic, HubSpot-shaped data only \u2014 mirrors\n// sample-payloads/hubspot-contract-expiration-fixture.json.\n// No network calls are made on this branch. Unless RADAR_REFERENCE_DATE is\n// set, the radar date is pinned to the fixture's as_of date so the demo\n// gives the same result every day.\n// =====================================================================\nconst ctx = $input.first().json;\nconst fixture = {\n  \"fixture_meta\": {\n    \"fixture_version\": \"1.0.0\",\n    \"description\": \"Sanitized, fully synthetic HubSpot-shaped deals, companies, associations and owners for SANDBOX_MODE. Every ID, name, domain, amount and date in this file is fictional.\",\n    \"synthetic\": true,\n    \"contains_real_data\": false,\n    \"portal_id\": \"99000001\",\n    \"as_of\": \"2026-11-16\",\n    \"source_pipeline_id\": \"default\",\n    \"source_closed_won_stage_id\": \"closedwon\",\n    \"renewal_pipeline_id\": \"880001\",\n    \"renewal_stage_ids\": {\n      \"90\": \"880001-identified\",\n      \"60\": \"880001-proposal\",\n      \"30\": \"880001-commit\"\n    },\n    \"renewal_closed_stage_ids\": [\n      \"880001-won\",\n      \"880001-lost\"\n    ]\n  },\n  \"deals_search_results\": {\n    \"total\": 9,\n    \"results\": [\n      {\n        \"id\": \"66001\",\n        \"properties\": {\n          \"hs_object_id\": \"66001\",\n          \"dealname\": \"Apex Global Tech - Enterprise Platform 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"240000\",\n          \"arr\": \"240000\",\n          \"contract_end_date\": \"2027-02-14\",\n          \"hubspot_owner_id\": \"70000001\",\n          \"renewal_radar_last_milestone\": null,\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66002\",\n        \"properties\": {\n          \"hs_object_id\": \"66002\",\n          \"dealname\": \"Vanguard Enterprise - Core Subscription 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"180000\",\n          \"arr\": \"180000\",\n          \"contract_end_date\": \"2027-01-15\",\n          \"hubspot_owner_id\": \"70000002\",\n          \"renewal_radar_last_milestone\": \"90\",\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66003\",\n        \"properties\": {\n          \"hs_object_id\": \"66003\",\n          \"dealname\": \"Northwind Example Systems - Global License 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"420000\",\n          \"arr\": \"420000\",\n          \"contract_end_date\": \"2026-12-16T00:00:00.000Z\",\n          \"hubspot_owner_id\": \"70000003\",\n          \"renewal_radar_last_milestone\": null,\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66004\",\n        \"properties\": {\n          \"hs_object_id\": \"66004\",\n          \"dealname\": \"Orion Data Example Corp - Analytics Suite 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"95000\",\n          \"arr\": \"95000\",\n          \"contract_end_date\": \"2027-02-13\",\n          \"hubspot_owner_id\": \"70000001\",\n          \"renewal_radar_last_milestone\": null,\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66005\",\n        \"properties\": {\n          \"hs_object_id\": \"66005\",\n          \"dealname\": \"Summit Example Holdings - Starter Plan 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"30000\",\n          \"arr\": \"30000\",\n          \"contract_end_date\": \"2027-01-15\",\n          \"hubspot_owner_id\": \"70000002\",\n          \"renewal_radar_last_milestone\": null,\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66006\",\n        \"properties\": {\n          \"hs_object_id\": \"66006\",\n          \"dealname\": \"Apex Global Tech - Analytics Add-on 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"60000\",\n          \"arr\": \"60000\",\n          \"contract_end_date\": \"2027-03-20\",\n          \"hubspot_owner_id\": \"70000001\",\n          \"renewal_radar_last_milestone\": null,\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66007\",\n        \"properties\": {\n          \"hs_object_id\": \"66007\",\n          \"dealname\": \"Vanguard Enterprise - EMEA Expansion 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"130000\",\n          \"arr\": \"130000\",\n          \"contract_end_date\": \"1800057600000\",\n          \"hubspot_owner_id\": \"70000002\",\n          \"renewal_radar_last_milestone\": null,\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66008\",\n        \"properties\": {\n          \"hs_object_id\": \"66008\",\n          \"dealname\": \"Northwind Example Systems - Platform License 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"150000\",\n          \"arr\": \"150000\",\n          \"contract_end_date\": \"2027-02-14\",\n          \"hubspot_owner_id\": \"70000002\",\n          \"renewal_radar_last_milestone\": null,\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66009\",\n        \"properties\": {\n          \"hs_object_id\": \"66009\",\n          \"dealname\": \"Orion Data Example Corp - Data Connectors 2025\",\n          \"pipeline\": \"default\",\n          \"dealstage\": \"closedwon\",\n          \"amount\": \"72000\",\n          \"arr\": \"72000\",\n          \"contract_end_date\": \"TBD\",\n          \"hubspot_owner_id\": \"70000001\",\n          \"renewal_radar_last_milestone\": null,\n          \"closedate\": \"2025-11-20T00:00:00.000Z\"\n        },\n        \"createdAt\": \"2025-10-01T09:00:00.000Z\",\n        \"updatedAt\": \"2026-11-01T09:00:00.000Z\",\n        \"archived\": false\n      }\n    ],\n    \"paging\": null\n  },\n  \"renewal_deals_search_results\": {\n    \"total\": 3,\n    \"results\": [\n      {\n        \"id\": \"66102\",\n        \"properties\": {\n          \"hs_object_id\": \"66102\",\n          \"dealname\": \"Vanguard Enterprise - Renewal 2027\",\n          \"pipeline\": \"880001\",\n          \"dealstage\": \"880001-identified\",\n          \"amount\": null,\n          \"closedate\": \"2027-01-15T00:00:00.000Z\",\n          \"contract_end_date\": \"2027-01-15\",\n          \"hubspot_owner_id\": \"70000002\",\n          \"renewal_source_deal_id\": \"66002\",\n          \"renewal_idempotency_key\": \"renewal-66002-2027-01-15\"\n        },\n        \"createdAt\": \"2026-10-17T08:00:00.000Z\",\n        \"updatedAt\": \"2026-10-17T08:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66107\",\n        \"properties\": {\n          \"hs_object_id\": \"66107\",\n          \"dealname\": \"Vanguard EMEA renewal (created manually)\",\n          \"pipeline\": \"880001\",\n          \"dealstage\": \"880001-identified\",\n          \"amount\": null,\n          \"closedate\": \"2027-01-20T00:00:00.000Z\",\n          \"contract_end_date\": null,\n          \"hubspot_owner_id\": \"70000002\",\n          \"renewal_source_deal_id\": null,\n          \"renewal_idempotency_key\": null\n        },\n        \"createdAt\": \"2026-10-17T08:00:00.000Z\",\n        \"updatedAt\": \"2026-10-17T08:00:00.000Z\",\n        \"archived\": false\n      },\n      {\n        \"id\": \"66108\",\n        \"properties\": {\n          \"hs_object_id\": \"66108\",\n          \"dealname\": \"Northwind Example Systems - Renewal 2027\",\n          \"pipeline\": \"880001\",\n          \"dealstage\": \"880001-identified\",\n          \"amount\": null,\n          \"closedate\": \"2027-02-14T00:00:00.000Z\",\n          \"contract_end_date\": \"2027-02-14\",\n          \"hubspot_owner_id\": \"70000002\",\n          \"renewal_source_deal_id\": null,\n          \"renewal_idempotency_key\": \"renewal-66008-2027-02-14\"\n        },\n        \"createdAt\": \"2026-10-17T08:00:00.000Z\",\n        \"updatedAt\": \"2026-10-17T08:00:00.000Z\",\n        \"archived\": false\n      }\n    ],\n    \"paging\": null\n  },\n  \"deal_company_associations\": {\n    \"status\": \"COMPLETE\",\n    \"results\": [\n      {\n        \"from\": {\n          \"id\": \"66001\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55001,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66002\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55002,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66003\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55003,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66004\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55004,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66005\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55005,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66006\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55001,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66007\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55002,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66008\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55003,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66009\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55004,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66102\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55002,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66107\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55002,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      },\n      {\n        \"from\": {\n          \"id\": \"66108\"\n        },\n        \"to\": [\n          {\n            \"toObjectId\": 55003,\n            \"associationTypes\": [\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 5,\n                \"label\": \"Primary\"\n              },\n              {\n                \"category\": \"HUBSPOT_DEFINED\",\n                \"typeId\": 341,\n                \"label\": null\n              }\n            ]\n          }\n        ]\n      }\n    ]\n  },\n  \"companies_batch_read\": {\n    \"status\": \"COMPLETE\",\n    \"results\": [\n      {\n        \"id\": \"55001\",\n        \"properties\": {\n          \"hs_object_id\": \"55001\",\n          \"name\": \"Apex Global Tech\",\n          \"domain\": \"apexglobaltech.example.com\",\n          \"customer_tier\": \"Enterprise\"\n        },\n        \"archived\": false\n      },\n      {\n        \"id\": \"55002\",\n        \"properties\": {\n          \"hs_object_id\": \"55002\",\n          \"name\": \"Vanguard Enterprise\",\n          \"domain\": \"vanguard-enterprise.example.com\",\n          \"customer_tier\": \"Enterprise\"\n        },\n        \"archived\": false\n      },\n      {\n        \"id\": \"55003\",\n        \"properties\": {\n          \"hs_object_id\": \"55003\",\n          \"name\": \"Northwind Example Systems\",\n          \"domain\": \"northwind-systems.example.com\",\n          \"customer_tier\": \"Strategic\"\n        },\n        \"archived\": false\n      },\n      {\n        \"id\": \"55004\",\n        \"properties\": {\n          \"hs_object_id\": \"55004\",\n          \"name\": \"Orion Data Example Corp\",\n          \"domain\": \"orion-data.example.com\",\n          \"customer_tier\": \"Enterprise\"\n        },\n        \"archived\": false\n      },\n      {\n        \"id\": \"55005\",\n        \"properties\": {\n          \"hs_object_id\": \"55005\",\n          \"name\": \"Summit Example Holdings\",\n          \"domain\": \"summit-holdings.example.com\",\n          \"customer_tier\": \"Mid-Market\"\n        },\n        \"archived\": false\n      }\n    ]\n  },\n  \"owners\": {\n    \"results\": [\n      {\n        \"id\": \"70000001\",\n        \"email\": \"ava.example@example.com\",\n        \"firstName\": \"Ava\",\n        \"lastName\": \"Example\",\n        \"userId\": 81000001,\n        \"archived\": false\n      },\n      {\n        \"id\": \"70000002\",\n        \"email\": \"ben.sample@example.com\",\n        \"firstName\": \"Ben\",\n        \"lastName\": \"Sample\",\n        \"userId\": 81000002,\n        \"archived\": false\n      },\n      {\n        \"id\": \"70000003\",\n        \"email\": \"cara.placeholder@example.com\",\n        \"firstName\": \"Cara\",\n        \"lastName\": \"Placeholder\",\n        \"userId\": 81000003,\n        \"archived\": true\n      },\n      {\n        \"id\": \"70000099\",\n        \"email\": \"renewals-desk@example.com\",\n        \"firstName\": \"Renewals\",\n        \"lastName\": \"Desk\",\n        \"userId\": 81000099,\n        \"archived\": false\n      }\n    ],\n    \"paging\": null\n  }\n};\n\nconst config = JSON.parse(JSON.stringify(ctx.config));\nif (config.radar.referenceDateSource !== 'RADAR_REFERENCE_DATE' && fixture.fixture_meta && fixture.fixture_meta.as_of) {\n  config.radar.referenceDate = fixture.fixture_meta.as_of;\n  config.radar.referenceDateSource = 'fixture_as_of';\n}\n\nreturn [{\n  json: {\n    ...ctx,\n    config,\n    dataSource: 'MOCK_FIXTURE',\n    raw: fixture,\n  },\n}];\n"
+      },
+      "id": "8b50b535-ffab-5931-8abb-efc0ae0a27d3",
+      "name": "Load Mock Fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config & Safety Gate').first().json.config.hubspot.apiBaseUrl }}/crm/v3/objects/deals/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Config & Safety Gate').first().json.config.live.searchExpiringBody) }}",
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "paginationMode": "updateAParameterInEachRequest",
+            "parameters": {
+              "parameters": [
+                {
+                  "type": "body",
+                  "name": "after",
+                  "value": "={{ $response.body.paging?.next?.after }}"
+                }
+              ]
+            },
+            "paginationCompleteWhen": "other",
+            "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+            "limitPagesFetched": true,
+            "maxRequests": 50,
+            "requestInterval": 250
+          }
+        }
+      },
+      "id": "309b3ced-f6d2-5a15-92df-c232abb6166c",
+      "name": "Search Expiring Deals (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        460
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config & Safety Gate').first().json.config.hubspot.apiBaseUrl }}/crm/v3/objects/deals/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Config & Safety Gate').first().json.config.live.searchRenewalsBody) }}",
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "paginationMode": "updateAParameterInEachRequest",
+            "parameters": {
+              "parameters": [
+                {
+                  "type": "body",
+                  "name": "after",
+                  "value": "={{ $response.body.paging?.next?.after }}"
+                }
+              ]
+            },
+            "paginationCompleteWhen": "other",
+            "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+            "limitPagesFetched": true,
+            "maxRequests": 50,
+            "requestInterval": 250
+          }
+        }
+      },
+      "id": "72320570-a779-5362-9e80-e270b206ebfc",
+      "name": "Search Existing Renewals (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        940,
+        460
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Prepare Association Batches (live)\n// Collects source + existing renewal deal IDs from the two searches and\n// splits them into v4 association batch-read requests (100 IDs each).\n// Emits a single { noDeals: true } item when nothing needs enriching.\n// =====================================================================\nconst cfg = $('Config & Safety Gate').first().json.config;\nconst pages = (name) => { try { return $(name).all(); } catch (e) { return []; } };\nconst ids = [\n  ...pages('Search Expiring Deals (Live)'),\n  ...pages('Search Existing Renewals (Live)'),\n].flatMap((p) => ((p.json && p.json.results) || []).map((r) => String(r.id)));\nconst unique = [...new Set(ids)];\n\nif (!unique.length) return [{ json: { noDeals: true } }];\n\nconst out = [];\nfor (let i = 0; i < unique.length; i += 100) {\n  out.push({\n    json: {\n      noDeals: false,\n      url: `${cfg.hubspot.apiBaseUrl}/crm/v4/associations/deals/companies/batch/read`,\n      body: { inputs: unique.slice(i, i + 100).map((id) => ({ id })) },\n    },\n  });\n}\nreturn out;\n"
+      },
+      "id": "843dd3c9-32e9-5707-92a7-b27f59eaa702",
+      "name": "Prepare Association Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        460
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "55ac9777-0704-5955-9573-e1dad3780458",
+              "leftValue": "={{ $json.noDeals }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c392e5d4-ffea-51c4-bc81-545d7fe691b9",
+      "name": "Has Deals To Enrich?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 300
+            }
+          }
+        }
+      },
+      "id": "edea02e6-e9aa-5852-907b-135a5279be34",
+      "name": "Read Deal-Company Associations (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        380
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Prepare Company Batches (live)\n// Unique company IDs from the association results, chunked into\n// /crm/v3/objects/companies/batch/read requests (100 IDs each).\n// =====================================================================\nconst cfg = $('Config & Safety Gate').first().json.config;\nconst companyIds = [...new Set($input.all()\n  .flatMap((i) => (i.json && i.json.results) || [])\n  .flatMap((r) => (r.to || []).map((t) => String(t.toObjectId))))];\n\nif (!companyIds.length) return [{ json: { noCompanies: true, url: `${cfg.hubspot.apiBaseUrl}/crm/v3/objects/companies/batch/read`, body: { properties: cfg.live.companyProperties, inputs: [] } } }];\n\nconst out = [];\nfor (let i = 0; i < companyIds.length; i += 100) {\n  out.push({\n    json: {\n      noCompanies: false,\n      url: `${cfg.hubspot.apiBaseUrl}/crm/v3/objects/companies/batch/read`,\n      body: { properties: cfg.live.companyProperties, inputs: companyIds.slice(i, i + 100).map((id) => ({ id })) },\n    },\n  });\n}\nreturn out;\n"
+      },
+      "id": "655b6546-28c4-55aa-a7ec-f1253356a496",
+      "name": "Prepare Company Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 300
+            }
+          }
+        }
+      },
+      "id": "b932a69a-b2bc-58b3-aa8d-25eb5f20112f",
+      "name": "Read Companies (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        380
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config & Safety Gate').first().json.config.hubspot.apiBaseUrl }}/crm/v3/owners",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "500"
+            },
+            {
+              "name": "archived",
+              "value": "false"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "after",
+                    "value": "={{ $response.body.paging?.next?.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 20,
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "02055305-1d8d-5497-9ed9-6b08a1eff9ce",
+      "name": "Get Active Owners (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2260,
+        380
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Normalize Live HubSpot Data\n// Reassembles the paginated / batched HubSpot responses into the same\n// shape as the mock fixture, so the engine has one input format.\n// Owner emails are dropped here; only IDs, names and status continue.\n// =====================================================================\nconst ctx = $('Config & Safety Gate').first().json;\nconst all = (name) => { try { return $(name).isExecuted ? $(name).all() : []; } catch (e) { return []; } };\nconst pick = (items, key = 'results') => items.flatMap((i) => {\n  const j = i.json || {};\n  if (j.error) return [];\n  const body = j.body && typeof j.body === 'object' ? j.body : j;\n  return Array.isArray(body[key]) ? body[key] : [];\n});\n\nconst deals = pick(all('Search Expiring Deals (Live)'));\nconst renewals = pick(all('Search Existing Renewals (Live)'));\nconst assoc = pick(all('Read Deal-Company Associations (Live)'));\nconst companyItems = all('Read Companies (Live)');\nconst companies = pick(companyItems);\nconst owners = pick(all('Get Active Owners (Live)')).map((o) => ({ id: String(o.id), firstName: o.firstName || '', lastName: o.lastName || '', archived: Boolean(o.archived) }));\n\nconst searchErrors = [...all('Search Expiring Deals (Live)'), ...all('Search Existing Renewals (Live)')].filter((i) => i.json && i.json.error);\nif (searchErrors.length) throw new Error('HubSpot search failed \u2014 halting before any renewal decision.');\nconst companyErrors = companyItems.filter((i) => i.json && i.json.error && !(i.json.noCompanies));\n\nreturn [{\n  json: {\n    ...ctx,\n    dataSource: 'LIVE_HUBSPOT',\n    raw: {\n      fixture_meta: { synthetic: false, portal_id: ctx.config.hubspot.portalId, as_of: ctx.config.radar.referenceDate },\n      deals_search_results: { total: deals.length, results: deals },\n      renewal_deals_search_results: { total: renewals.length, results: renewals },\n      deal_company_associations: { results: assoc },\n      companies_batch_read: { results: companies },\n      owners: { results: owners },\n      fetch_warnings: companyErrors.length ? [`${companyErrors.length} company batch read(s) failed \u2014 affected deals are flagged as missing company data.`] : [],\n    },\n  },\n}];\n"
+      },
+      "id": "5445d96e-adce-5a39-b590-9c42ee0925eb",
+      "name": "Normalize Live HubSpot Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Renewal Radar & Deal Provisioning Engine\n// 1. Normalizes HubSpot deals, companies, associations and owners.\n// 2. Finds enterprise contracts hitting the 90/60/30-day milestones.\n// 3. Prevents duplicate renewal deals (source ID, idempotency key,\n//    company association match, and in-run dedupe).\n// 4. Builds HubSpot batch payloads: create renewal deals, advance\n//    renewal stages, write back the last milestone alerted.\n// 5. Applies guardrails: per-run cap, circuit breaker, permissions.\n// =====================================================================\nconst ctx = $input.first().json;\nconst { config: cfg, gate } = ctx;\nconst H = cfg.hubspot;\nconst R = cfg.radar;\nconst L = cfg.limits;\nconst P = H.props;\nconst raw = ctx.raw || {};\nconst DAY = 86400000;\n\nconst results = (obj) => (obj && Array.isArray(obj.results) ? obj.results : []);\nconst num = (v) => { const x = Number(v); return v === null || v === undefined || v === '' || !Number.isFinite(x) ? null : x; };\nconst round2 = (v) => Math.round(v * 100) / 100;\n\n// Accepts YYYY-MM-DD, ISO date-time, or epoch milliseconds. Returns YYYY-MM-DD (UTC) or null.\nfunction parseDate(v) {\n  if (v === null || v === undefined || v === '') return null;\n  const s = String(v).trim();\n  let ms = NaN;\n  if (/^\\d{10,14}$/.test(s)) ms = Number(s);\n  else if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) ms = Date.parse(`${s}T00:00:00Z`);\n  else ms = Date.parse(s);\n  if (!Number.isFinite(ms)) return null;\n  return new Date(ms).toISOString().slice(0, 10);\n}\nconst refDate = R.referenceDate;\nconst refMs = Date.parse(`${refDate}T00:00:00Z`);\nconst daysUntil = (d) => Math.round((Date.parse(`${d}T00:00:00Z`) - refMs) / DAY);\nconst daysBetween = (a, b) => Math.abs(Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / DAY));\n\n// ---------------------------------------------------------------------\n// 1. Normalize\n// ---------------------------------------------------------------------\nconst assocByDeal = {};\nfor (const a of results(raw.deal_company_associations)) {\n  const from = String(a.from && a.from.id);\n  const tos = (a.to || []);\n  const primary = tos.find((t) => (t.associationTypes || []).some((x) => Number(x.typeId) === Number(H.associationTypeId)));\n  const ordered = primary ? [primary, ...tos.filter((t) => t !== primary)] : tos;\n  assocByDeal[from] = [...new Set(ordered.map((t) => String(t.toObjectId)))];\n}\nconst companies = Object.fromEntries(results(raw.companies_batch_read).map((c) => [String(c.id), {\n  company_id: String(c.id),\n  name: (c.properties && c.properties.name) || `Company ${c.id}`,\n  domain: (c.properties && c.properties.domain) || null,\n  tier: (c.properties && c.properties[P.companyTier]) || null,\n}]));\nconst owners = Object.fromEntries(results(raw.owners).map((o) => [String(o.id), {\n  owner_id: String(o.id),\n  name: [o.firstName, o.lastName].filter(Boolean).join(' ') || `Owner ${o.id}`,\n  active: !o.archived,\n}]));\n\nconst sourceDeals = results(raw.deals_search_results).map((d) => {\n  const p = d.properties || {};\n  return {\n    deal_id: String(d.id),\n    dealname: p.dealname || `Deal ${d.id}`,\n    pipeline: p.pipeline || null,\n    dealstage: p.dealstage || null,\n    contract_end_raw: p[P.contractEndDate] ?? null,\n    contract_end_date: parseDate(p[P.contractEndDate]),\n    arr: num(p[P.arr]) ?? num(p.amount),\n    owner_id: p.hubspot_owner_id ? String(p.hubspot_owner_id) : null,\n    last_milestone: num(p[P.lastMilestone]),\n    company_ids: assocByDeal[String(d.id)] || [],\n  };\n});\n\nconst renewalDeals = results(raw.renewal_deals_search_results).map((d) => {\n  const p = d.properties || {};\n  return {\n    deal_id: String(d.id),\n    dealname: p.dealname || `Deal ${d.id}`,\n    pipeline: p.pipeline || null,\n    dealstage: p.dealstage || null,\n    closedate: parseDate(p.closedate),\n    contract_end_date: parseDate(p[P.contractEndDate]),\n    source_deal_id: p[P.renewalSourceDealId] ? String(p[P.renewalSourceDealId]) : null,\n    renewal_key: p[P.renewalKey] || null,\n    owner_id: p.hubspot_owner_id ? String(p.hubspot_owner_id) : null,\n    company_ids: assocByDeal[String(d.id)] || [],\n    is_closed: H.renewalClosedStageIds.includes(p.dealstage),\n  };\n}).filter((r) => r.pipeline === H.renewalPipelineId);\n\nconst renewalBySource = {};\nconst renewalByKey = {};\nfor (const r of renewalDeals) {\n  if (r.source_deal_id) renewalBySource[r.source_deal_id] = r;\n  if (r.renewal_key) renewalByKey[r.renewal_key] = r;\n}\nconst claimedRenewalIds = new Set(renewalDeals.filter((r) => r.source_deal_id || r.renewal_key).map((r) => r.deal_id));\n\n// ---------------------------------------------------------------------\n// 2. Evaluate each contract\n// ---------------------------------------------------------------------\nconst windowsAsc = [...R.windows].sort((a, b) => a - b);\nconst stageOrder = [...R.windows].sort((a, b) => b - a).map((w) => H.stageMap[w]);\nconst targetStageFor = (days) => { const w = windowsAsc.find((x) => days <= x); return w ? H.stageMap[w] : null; };\nconst fill = (tpl, vars) => tpl.replace(/\\{(\\w+)\\}/g, (m, k) => (vars[k] !== undefined && vars[k] !== null ? String(vars[k]) : m));\nconst seenKeys = new Set();\nconst dataQuality = [];\n\nconst contracts = sourceDeals.map((d) => {\n  const company = companies[d.company_ids[0]] || null;\n  const base = {\n    deal_id: d.deal_id,\n    dealname: d.dealname,\n    company_id: company ? company.company_id : (d.company_ids[0] || null),\n    company_name: company ? company.name : null,\n    company_tier: company ? company.tier : null,\n    arr: d.arr,\n    contract_end_date: d.contract_end_date,\n    owner_id: d.owner_id,\n    notes: [],\n  };\n\n  if (!H.sourceWonStageIds.includes(d.dealstage) || d.pipeline !== H.sourcePipelineId) {\n    return { ...base, status: 'SKIPPED_NOT_CLOSED_WON', days_until_expiration: null, milestone: null };\n  }\n  if (!d.contract_end_date) {\n    dataQuality.push({ deal_id: d.deal_id, issue: `Unparseable ${P.contractEndDate} value \"${d.contract_end_raw}\"` });\n    return { ...base, status: 'DATA_QUALITY_INVALID_DATE', days_until_expiration: null, milestone: null, notes: [`Contract end date \"${d.contract_end_raw}\" could not be parsed`] };\n  }\n  const days = daysUntil(d.contract_end_date);\n  base.days_until_expiration = days;\n\n  const tierOk = company && company.tier && R.enterpriseTierValues.includes(String(company.tier).toLowerCase());\n  const arrOk = d.arr !== null && d.arr >= R.enterpriseMinArr;\n  if (!tierOk && !arrOk) return { ...base, status: 'SKIPPED_NOT_ENTERPRISE', milestone: null, notes: [`Tier \"${base.company_tier || 'n/a'}\" and ARR ${d.arr ?? 'n/a'} are below the enterprise threshold`] };\n  if (d.arr === null) { dataQuality.push({ deal_id: d.deal_id, issue: `Missing ${P.arr} and amount` }); base.notes.push('ARR missing \u2014 renewal amount left blank'); }\n  if (days < 0) return { ...base, status: 'EXPIRED', milestone: null, notes: ['Contract already expired \u2014 outside radar scope'] };\n  if (days > R.provisionWithinDays) return { ...base, status: 'OUTSIDE_RADAR', milestone: null };\n  if (!company) { dataQuality.push({ deal_id: d.deal_id, issue: 'No associated company' }); base.notes.push('No associated company \u2014 renewal deal will not be associated'); }\n\n  // Milestone hit (exact day, or within catch-up tolerance if write-back keeps state)\n  let milestone = null; let catchup = false;\n  for (const w of windowsAsc) {\n    if (days <= w && days >= w - R.catchupDays && (d.last_milestone === null || d.last_milestone > w)) { milestone = w; catchup = days !== w; break; }\n  }\n  if (!milestone && d.last_milestone !== null && windowsAsc.includes(days) && d.last_milestone <= days) base.notes.push(`Milestone ${days}d already alerted`);\n\n  // Owner mapping\n  let ownerId = d.owner_id; let ownerNote = null;\n  if (!ownerId || !owners[ownerId] || !owners[ownerId].active) {\n    ownerNote = !ownerId ? 'Source deal has no owner' : `Owner ${ownerId} is inactive or not found`;\n    ownerId = H.fallbackOwnerId && owners[H.fallbackOwnerId] && owners[H.fallbackOwnerId].active ? H.fallbackOwnerId : null;\n    base.notes.push(`${ownerNote} \u2014 ${ownerId ? `assigned fallback owner ${ownerId}` : 'renewal left unassigned'}`);\n  }\n  const owner = ownerId ? owners[ownerId] : null;\n\n  // Duplicate prevention\n  const key = `renewal-${d.deal_id}-${d.contract_end_date}`;\n  let existing = null; let dupReason = null;\n  if (renewalBySource[d.deal_id]) { existing = renewalBySource[d.deal_id]; dupReason = `${P.renewalSourceDealId} match`; }\n  else if (renewalByKey[key]) { existing = renewalByKey[key]; dupReason = `${P.renewalKey} match`; }\n  else if (base.company_id) {\n    existing = renewalDeals.find((r) => !r.is_closed && !claimedRenewalIds.has(r.deal_id) && r.company_ids.includes(base.company_id)\n      && (r.contract_end_date || r.closedate) && daysBetween(r.contract_end_date || r.closedate, d.contract_end_date) <= R.associationMatchToleranceDays) || null;\n    if (existing) { dupReason = `open renewal deal on company ${base.company_id} closing within ${R.associationMatchToleranceDays}d`; claimedRenewalIds.add(existing.deal_id); }\n  }\n  if (!existing && seenKeys.has(key)) { dupReason = 'duplicate within this run'; }\n\n  const targetStage = targetStageFor(days);\n  const result = {\n    ...base,\n    milestone,\n    milestone_catchup: catchup,\n    idempotency_key: key,\n    target_stage: targetStage,\n    renewal_owner_id: ownerId,\n    renewal_owner_name: owner ? owner.name : null,\n    owner_fallback_used: Boolean(ownerNote),\n    existing_renewal: existing ? { deal_id: existing.deal_id, dealstage: existing.dealstage, matched_by: dupReason, is_closed: existing.is_closed } : null,\n  };\n\n  if (existing || dupReason) {\n    result.status = 'RENEWAL_EXISTS';\n    result.duplicate_prevented = dupReason;\n    if (dupReason && dupReason.startsWith('open renewal')) result.notes.push(`Matched existing renewal ${existing.deal_id} by association \u2014 review and set ${P.renewalSourceDealId}=${d.deal_id} on it`);\n    // Stage advancement: forward only, mapped stages only, never closed deals\n    if (existing && !existing.is_closed && targetStage) {\n      const cur = stageOrder.indexOf(existing.dealstage);\n      const tgt = stageOrder.indexOf(targetStage);\n      if (cur >= 0 && tgt > cur) result.stage_update = { deal_id: existing.deal_id, from: existing.dealstage, to: targetStage };\n      else if (cur < 0) result.notes.push(`Renewal ${existing.deal_id} is in unmapped stage \"${existing.dealstage}\" \u2014 stage left untouched`);\n    }\n    return result;\n  }\n\n  seenKeys.add(key);\n  const vars = { company_name: base.company_name || d.dealname, source_deal_name: d.dealname, contract_end_date: d.contract_end_date, contract_end_year: d.contract_end_date.slice(0, 4) };\n  const amount = d.arr !== null ? round2(d.arr * (1 + R.upliftPct / 100)) : null;\n  const properties = {\n    dealname: fill(R.dealNameTemplate, vars).slice(0, 250),\n    pipeline: H.renewalPipelineId,\n    dealstage: targetStage,\n    closedate: `${d.contract_end_date}T00:00:00.000Z`,\n    [P.contractEndDate]: d.contract_end_date,\n    [P.renewalSourceDealId]: d.deal_id,\n    [P.renewalKey]: key,\n  };\n  if (amount !== null) { properties.amount = String(amount); properties[P.arr] = String(d.arr); }\n  if (ownerId) properties.hubspot_owner_id = ownerId;\n  result.status = 'PROVISION';\n  result.provision_reason = milestone ? `Milestone ${milestone}d${catchup ? ' (catch-up)' : ''}` : `Backfill: no renewal deal within ${R.provisionWithinDays}d of expiration`;\n  result.create_input = {\n    properties,\n    associations: base.company_id && company ? [{ to: { id: base.company_id }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: H.associationTypeId }] }] : [],\n  };\n  return result;\n});\n\n// ---------------------------------------------------------------------\n// 3. Guardrails\n// ---------------------------------------------------------------------\nconst provisions = contracts.filter((c) => c.status === 'PROVISION').sort((a, b) => a.days_until_expiration - b.days_until_expiration || (b.arr || 0) - (a.arr || 0));\nconst datedTotal = contracts.filter((c) => c.status !== 'SKIPPED_NOT_CLOSED_WON').length;\nconst invalidPct = datedTotal ? (dataQuality.filter((q) => q.issue.startsWith('Unparseable')).length / datedTotal) * 100 : 0;\nconst cbReasons = [];\nif (provisions.length > L.circuitBreakerMaxProposed) cbReasons.push(`${provisions.length} renewal deals proposed (breaker at ${L.circuitBreakerMaxProposed}) \u2014 check ${P.contractEndDate} mapping`);\nif (datedTotal >= 5 && invalidPct >= L.circuitBreakerInvalidDatePct) cbReasons.push(`${Math.round(invalidPct)}% of contracts have invalid end dates (breaker at ${L.circuitBreakerInvalidDatePct}%)`);\nconst circuitBreaker = { tripped: cbReasons.length > 0, reasons: cbReasons, proposed_creates: provisions.length, invalid_date_pct: Math.round(invalidPct * 10) / 10 };\n\nprovisions.forEach((c, i) => {\n  if (circuitBreaker.tripped) { c.status = 'BLOCKED_CIRCUIT_BREAKER'; c.notes.push('Circuit breaker tripped \u2014 creation held'); }\n  else if (i >= L.maxRenewalDealsPerRun) { c.status = 'DEFERRED_RATE_LIMIT'; c.notes.push(`Per-run cap of ${L.maxRenewalDealsPerRun} reached \u2014 will be created on a later run`); }\n});\n\n// ---------------------------------------------------------------------\n// 4. HubSpot batch operations\n// ---------------------------------------------------------------------\nconst chunk = (arr, n) => { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; };\nconst blockedBy = (permKey) => {\n  if (gate.sandboxMode) return 'SANDBOX_MODE';\n  if (circuitBreaker.tripped) return 'CIRCUIT_BREAKER';\n  if (gate.requested.dryRun) return 'DRY_RUN';\n  if (gate.configErrors.length) return 'CONFIG_INVALID';\n  if (!gate.mappingExplicit) return 'MAPPING_NOT_CONFIGURED';\n  if (!gate.permissions[permKey]) return { createRenewalDeals: 'CREATION_DISABLED', updateRenewalStages: 'STAGE_UPDATES_DISABLED', milestoneWriteback: 'WRITEBACK_DISABLED' }[permKey];\n  return null;\n};\nconst operations = [];\nconst toCreate = contracts.filter((c) => c.status === 'PROVISION');\nchunk(toCreate, L.batchSize).forEach((group, i) => operations.push({\n  op_id: `create-${i + 1}`, kind: 'CREATE_RENEWAL_DEALS', method: 'POST', path: '/crm/v3/objects/deals/batch/create',\n  record_count: group.length, keys: group.map((c) => c.idempotency_key), source_deal_ids: group.map((c) => c.deal_id),\n  body: { inputs: group.map((c) => c.create_input) }, blocked_reason: blockedBy('createRenewalDeals'),\n}));\nconst stageUpdates = circuitBreaker.tripped ? [] : contracts.filter((c) => c.stage_update).map((c) => c.stage_update);\nchunk(stageUpdates, L.batchSize).forEach((group, i) => operations.push({\n  op_id: `stage-${i + 1}`, kind: 'UPDATE_RENEWAL_STAGES', method: 'POST', path: '/crm/v3/objects/deals/batch/update',\n  record_count: group.length, deal_ids: group.map((g) => g.deal_id),\n  body: { inputs: group.map((g) => ({ id: g.deal_id, properties: { dealstage: g.to } })) }, blocked_reason: blockedBy('updateRenewalStages'),\n}));\nconst milestoneHits = contracts.filter((c) => c.milestone);\nchunk(milestoneHits, L.batchSize).forEach((group, i) => operations.push({\n  op_id: `milestone-${i + 1}`, kind: 'WRITEBACK_MILESTONES', method: 'POST', path: '/crm/v3/objects/deals/batch/update',\n  record_count: group.length, deal_ids: group.map((c) => c.deal_id),\n  body: { inputs: group.map((c) => ({ id: c.deal_id, properties: { [P.lastMilestone]: String(c.milestone) } })) }, blocked_reason: blockedBy('milestoneWriteback'),\n}));\noperations.forEach((o) => { o.url = `${H.apiBaseUrl}${o.path}`; o.permitted = o.blocked_reason === null; });\n\n// ---------------------------------------------------------------------\n// 5. Forecast & stats\n// ---------------------------------------------------------------------\nconst inRadar = contracts.filter((c) => c.days_until_expiration !== null && c.days_until_expiration >= 0 && c.days_until_expiration <= R.provisionWithinDays && !['SKIPPED_NOT_ENTERPRISE', 'SKIPPED_NOT_CLOSED_WON', 'DATA_QUALITY_INVALID_DATE'].includes(c.status));\nconst bucketOf = (d) => windowsAsc.find((w) => d <= w);\nconst forecast = windowsAsc.map((w) => {\n  const rows = inRadar.filter((c) => bucketOf(c.days_until_expiration) === w);\n  return { window_days: w, contracts: rows.length, arr_at_risk: round2(rows.reduce((a, c) => a + (c.arr || 0), 0)), without_renewal_deal: rows.filter((c) => !c.existing_renewal).length };\n});\nconst stats = {\n  contracts_scanned: contracts.length,\n  enterprise_in_radar: inRadar.length,\n  milestone_hits: milestoneHits.length,\n  milestone_hits_by_window: Object.fromEntries(windowsAsc.map((w) => [w, milestoneHits.filter((c) => c.milestone === w).length])),\n  renewal_deals_to_create: toCreate.length,\n  renewal_deals_deferred: contracts.filter((c) => c.status === 'DEFERRED_RATE_LIMIT').length,\n  renewal_deals_blocked: contracts.filter((c) => c.status === 'BLOCKED_CIRCUIT_BREAKER').length,\n  duplicates_prevented: contracts.filter((c) => c.status === 'RENEWAL_EXISTS').length,\n  stage_advances_proposed: stageUpdates.length,\n  skipped_not_enterprise: contracts.filter((c) => c.status === 'SKIPPED_NOT_ENTERPRISE').length,\n  outside_radar: contracts.filter((c) => c.status === 'OUTSIDE_RADAR').length,\n  data_quality_issues: dataQuality.length,\n  total_arr_in_radar: round2(inRadar.reduce((a, c) => a + (c.arr || 0), 0)),\n  arr_without_renewal_deal: round2(inRadar.filter((c) => !c.existing_renewal).reduce((a, c) => a + (c.arr || 0), 0)),\n};\n\nreturn [{\n  json: {\n    runId: ctx.runId, startedAt: ctx.startedAt, trigger: ctx.trigger, workflow: ctx.workflow, workflowVersion: ctx.workflowVersion,\n    dataSource: ctx.dataSource,\n    referenceDate: refDate,\n    config: cfg,\n    gate,\n    circuitBreaker,\n    stats,\n    forecast,\n    contracts: contracts.map(({ create_input, ...rest }) => ({ ...rest, has_create_payload: Boolean(create_input) })),\n    dataQuality,\n    fetchWarnings: raw.fetch_warnings || [],\n    operations,\n    liveWriteAllowed: operations.some((o) => o.permitted),\n    evaluatedAt: new Date().toISOString(),\n  },\n}];\n"
+      },
+      "id": "daeaa0f1-e574-5ca8-91c4-a64b3a17b969",
+      "name": "Renewal Radar & Provisioning Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "1054cf65-1dea-555b-b863-2216f3a03739",
+              "leftValue": "={{ $json.liveWriteAllowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ed856ef3-2935-5ca8-99a3-b386d3e77c98",
+      "name": "Live Writes Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2960,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Split HubSpot Operations (live branch only)\n// Second, independent safety interlock. Re-checks the gate and emits one\n// item per PERMITTED batch operation, creates first.\n// =====================================================================\nconst plan = $input.first().json;\nconst g = plan.gate;\nif (!(plan.liveWriteAllowed === true && g.sandboxMode === false && g.dryRun === false && g.requested.dryRun === false && g.mappingExplicit === true && plan.circuitBreaker.tripped === false)) {\n  throw new Error('Safety interlock: HubSpot write branch reached without full authorization. No requests were sent.');\n}\nconst permKey = { CREATE_RENEWAL_DEALS: 'createRenewalDeals', UPDATE_RENEWAL_STAGES: 'updateRenewalStages', WRITEBACK_MILESTONES: 'milestoneWriteback' };\nconst order = { CREATE_RENEWAL_DEALS: 0, UPDATE_RENEWAL_STAGES: 1, WRITEBACK_MILESTONES: 2 };\n\nreturn plan.operations\n  .filter((o) => o.permitted && g.permissions[permKey[o.kind]] === true)\n  .sort((a, b) => order[a.kind] - order[b.kind])\n  .map((o) => ({ json: { op_id: o.op_id, kind: o.kind, url: o.url, body: o.body, record_count: o.record_count } }));\n"
+      },
+      "id": "2991bfa6-c35a-5588-951b-a4044a9a9890",
+      "name": "Split HubSpot Operations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3200,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1000
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": false,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "670c3097-51e2-5316-89bb-c85ce15f0218",
+      "name": "HubSpot Batch Create / Update (Live)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3440,
+        160
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Collect HubSpot Results (live branch)\n// Pairs each batch response with its operation. Handles 200/201 (all\n// succeeded), 207 (partial) and errors. Maps created renewal deal IDs\n// back to source contracts via the idempotency key property.\n// =====================================================================\nconst plan = $('Renewal Radar & Provisioning Engine').first().json;\nconst sent = $('Split HubSpot Operations').all();\nconst responses = $input.all();\nconst keyProp = plan.config.hubspot.props.renewalKey;\n\nconst opResults = responses.map((r, i) => {\n  const idx = r.pairedItem && typeof r.pairedItem.item === 'number' ? r.pairedItem.item : i;\n  const req = (sent[idx] || sent[i] || { json: {} }).json;\n  const j = r.json || {};\n  const status = Number(j.statusCode);\n  const body = j.body || {};\n  const ok = !j.error && status >= 200 && status < 300;\n  const created = (body.results || []).map((x) => ({ deal_id: String(x.id), idempotency_key: x.properties ? x.properties[keyProp] : null }));\n  const errors = (body.errors || []).map((e) => String(e.message || e.category || 'error').slice(0, 200));\n  return {\n    op_id: req.op_id,\n    kind: req.kind,\n    record_count: req.record_count,\n    status: !ok ? 'FAILED' : status === 207 || errors.length ? 'PARTIAL' : 'APPLIED',\n    http_status: Number.isFinite(status) ? status : null,\n    succeeded: (body.results || []).length,\n    errors: j.error ? [String(j.error.message || j.error).slice(0, 300)] : errors,\n    created,\n  };\n});\n\nconst createdByKey = Object.fromEntries(opResults.flatMap((o) => o.created).filter((c) => c.idempotency_key).map((c) => [c.idempotency_key, c.deal_id]));\nconst executedIds = new Set(opResults.map((o) => o.op_id));\nfor (const o of plan.operations) if (!executedIds.has(o.op_id)) opResults.push({ op_id: o.op_id, kind: o.kind, record_count: o.record_count, status: o.blocked_reason ? `BLOCKED_${o.blocked_reason}` : 'NOT_SENT', http_status: null, succeeded: 0, errors: [], created: [] });\n\nreturn [{\n  json: {\n    ...plan,\n    writeResults: opResults,\n    createdRenewals: createdByKey,\n    writeSummary: {\n      mode: 'LIVE',\n      deals_created: Object.keys(createdByKey).length,\n      operations_applied: opResults.filter((o) => o.status === 'APPLIED').length,\n      operations_partial: opResults.filter((o) => o.status === 'PARTIAL').length,\n      operations_failed: opResults.filter((o) => o.status === 'FAILED').length,\n      operations_previewed: 0,\n    },\n  },\n}];\n"
+      },
+      "id": "5779b571-cac3-5b61-9bf5-d95481b2ec0a",
+      "name": "Collect HubSpot Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3680,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Dry-Run HubSpot Preview\n// Records exactly what WOULD be sent to HubSpot. No external calls.\n// =====================================================================\nconst plan = $input.first().json;\nconst g = plan.gate;\nlet mode = 'DRY_RUN_PREVIEW';\nif (g.sandboxMode) mode = 'SANDBOX_PREVIEW';\nelse if (plan.circuitBreaker.tripped) mode = 'BLOCKED_CIRCUIT_BREAKER';\nelse if (g.configErrors.length) mode = 'BLOCKED_CONFIG_INVALID';\nelse if (!plan.operations.length) mode = 'NOTHING_TO_WRITE';\n\nconst writeResults = plan.operations.map((o) => ({\n  op_id: o.op_id,\n  kind: o.kind,\n  record_count: o.record_count,\n  status: `PREVIEW_${o.blocked_reason || 'NOT_SENT'}`,\n  http_status: null,\n  succeeded: 0,\n  errors: [],\n  created: [],\n  would_send: { method: o.method, url: o.url, body: o.body },\n}));\n\nreturn [{\n  json: {\n    ...plan,\n    writeResults,\n    createdRenewals: {},\n    writeSummary: { mode, deals_created: 0, operations_applied: 0, operations_partial: 0, operations_failed: 0, operations_previewed: writeResults.length },\n  },\n}];\n"
+      },
+      "id": "f26e1641-199f-52a6-b7c2-fe575f69fb26",
+      "name": "Dry-Run HubSpot Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3200,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Build RevOps Alerts\n// Slack Block Kit message grouped by Account Manager, plus a compact JSON\n// webhook event. Uses HubSpot record IDs, company names, owner names and\n// ARR only \u2014 no contact-level personal data.\n// =====================================================================\nconst run = $input.first().json;\nconst { gate, circuitBreaker: cb, stats, config: cfg, forecast } = run;\nconst maxItems = cfg.alerts.maxItemsPerSection;\nconst portal = cfg.hubspot.portalId;\nconst SEV = { INFO: 0, WARNING: 1, CRITICAL: 2 };\n\nlet fmt;\ntry { fmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: cfg.radar.currency, maximumFractionDigits: 0 }); } catch (e) { fmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }); }\nconst money = (v) => (v === null || v === undefined ? 'n/a' : fmt.format(v));\nconst dealUrl = (id) => `https://app.hubspot.com/contacts/${encodeURIComponent(portal)}/record/0-3/${encodeURIComponent(id)}`;\nconst link = (id, label) => `<${dealUrl(id)}|${label}>`;\nconst truncate = (s, max = 2900) => (s.length > max ? `${s.slice(0, max - 20)}\\n_\u2026truncated_` : s);\nconst urgency = (d) => (d <= 30 ? ':red_circle:' : d <= 60 ? ':large_orange_circle:' : ':large_yellow_circle:');\n\nconst createdByKey = run.createdRenewals || {};\nconst mode = run.writeSummary.mode;\nconst actionable = run.contracts.filter((c) => c.milestone || ['PROVISION', 'DEFERRED_RATE_LIMIT', 'BLOCKED_CIRCUIT_BREAKER'].includes(c.status) || (c.status === 'RENEWAL_EXISTS' && c.days_until_expiration !== null && c.days_until_expiration <= cfg.radar.provisionWithinDays && (c.milestone || String(c.duplicate_prevented || '').startsWith('open renewal'))));\n\nconst renewalLabel = (c) => {\n  if (c.status === 'PROVISION') {\n    const id = createdByKey[c.idempotency_key];\n    if (id) return `:new: renewal ${link(id, `#${id}`)} created`;\n    return mode === 'LIVE' ? ':x: renewal creation not confirmed' : `:memo: renewal deal ${mode === 'SANDBOX_PREVIEW' ? 'previewed (sandbox)' : 'previewed'}`;\n  }\n  if (c.status === 'RENEWAL_EXISTS' && c.existing_renewal) {\n    const stage = c.stage_update ? ` \u00b7 stage \u2192 \\`${c.stage_update.to}\\`${run.gate.permissions.updateRenewalStages && mode === 'LIVE' ? '' : ' (proposed)'}` : '';\n    return `:white_check_mark: renewal ${link(c.existing_renewal.deal_id, `#${c.existing_renewal.deal_id}`)} exists (${c.existing_renewal.matched_by})${stage}`;\n  }\n  if (c.status === 'DEFERRED_RATE_LIMIT') return ':hourglass: creation deferred (per-run cap)';\n  if (c.status === 'BLOCKED_CIRCUIT_BREAKER') return ':octagonal_sign: creation blocked (circuit breaker)';\n  return `status ${c.status}`;\n};\n\nlet severity = 'INFO';\nif (actionable.length || run.dataQuality.length) severity = 'WARNING';\nconst thirtyNoRenewal = actionable.some((c) => c.days_until_expiration <= 30 && !c.existing_renewal && !createdByKey[c.idempotency_key]);\nif (cb.tripped || thirtyNoRenewal || run.writeSummary.operations_failed > 0 || run.writeSummary.operations_partial > 0) severity = 'CRITICAL';\n\nconst modeLabel = {\n  LIVE: ':satellite_antenna: LIVE', SANDBOX_PREVIEW: ':test_tube: SANDBOX (mock data)', DRY_RUN_PREVIEW: ':eyes: DRY RUN',\n  BLOCKED_CIRCUIT_BREAKER: ':octagonal_sign: BLOCKED (circuit breaker)', BLOCKED_CONFIG_INVALID: ':no_entry: BLOCKED (invalid config)', NOTHING_TO_WRITE: ':white_check_mark: NOTHING TO WRITE',\n}[mode] || mode;\nconst header = { INFO: ':calendar: Renewal Radar \u2014 No Milestones Today', WARNING: ':calendar: Renewal Radar \u2014 Contracts Hitting Renewal Milestones', CRITICAL: ':rotating_light: Renewal Radar \u2014 Urgent Renewals Need Attention' }[severity];\n\nconst blocks = [];\nblocks.push({ type: 'header', text: { type: 'plain_text', text: header, emoji: true } });\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*Run* \\`${run.runId}\\`  \u00b7  *Mode* ${modeLabel}  \u00b7  *Source* ${run.dataSource}  \u00b7  *Radar date* ${run.referenceDate}  \u00b7  *Windows* ${cfg.radar.windows.join('/')}d` }] });\nif (cb.tripped) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`:octagonal_sign: *CIRCUIT BREAKER TRIPPED \u2014 no renewal deals were created*\\n${cb.reasons.map((r) => `\u2022 ${r}`).join('\\n')}`) } });\n\nblocks.push({\n  type: 'section',\n  fields: [\n    { type: 'mrkdwn', text: `*Enterprise contracts in radar*\\n${stats.enterprise_in_radar} (\u2264${cfg.radar.provisionWithinDays}d)` },\n    { type: 'mrkdwn', text: `*ARR up for renewal*\\n${money(stats.total_arr_in_radar)}` },\n    { type: 'mrkdwn', text: `*ARR without a renewal deal*\\n${money(stats.arr_without_renewal_deal)}` },\n    { type: 'mrkdwn', text: `*Milestone hits today*\\n${cfg.radar.windows.map((w) => `${w}d: ${stats.milestone_hits_by_window[w] || 0}`).join(' \u00b7 ')}` },\n    { type: 'mrkdwn', text: `*Renewal deals*\\n${run.writeSummary.deals_created} created \u00b7 ${stats.renewal_deals_to_create} ${mode === 'LIVE' ? 'queued' : 'previewed'}` },\n    { type: 'mrkdwn', text: `*Duplicates prevented*\\n${stats.duplicates_prevented}` },\n  ],\n});\n\nblocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*:bar_chart: Renewal forecast by window*\\n${forecast.map((f) => `\u2022 \u2264${f.window_days}d \u2014 ${f.contracts} contract(s) \u00b7 ${money(f.arr_at_risk)} ARR \u00b7 ${f.without_renewal_deal} without renewal deal`).join('\\n')}` } });\nblocks.push({ type: 'divider' });\n\nconst byOwner = {};\nfor (const c of actionable) {\n  const key = c.renewal_owner_id || 'unassigned';\n  (byOwner[key] = byOwner[key] || { name: c.renewal_owner_name || 'Unassigned', rows: [] }).rows.push(c);\n}\nconst ownerKeys = Object.keys(byOwner).sort((a, b) => Math.min(...byOwner[a].rows.map((r) => r.days_until_expiration)) - Math.min(...byOwner[b].rows.map((r) => r.days_until_expiration)));\nif (!ownerKeys.length) {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*:busts_in_silhouette: Account Managers*\\nNo contracts need action today.' } });\n} else {\n  for (const k of ownerKeys.slice(0, 20)) {\n    const grp = byOwner[k];\n    const arr = grp.rows.reduce((a, c) => a + (c.arr || 0), 0);\n    const rows = grp.rows.sort((a, b) => a.days_until_expiration - b.days_until_expiration).slice(0, maxItems).map((c) => {\n      const tag = c.milestone ? `*${c.milestone}-day milestone*${c.milestone_catchup ? ' (catch-up)' : ''}` : `${c.days_until_expiration}d out`;\n      const extra = c.owner_fallback_used ? '\\n      :warning: original owner inactive or missing \u2014 fallback owner assigned' : '';\n      return `${urgency(c.days_until_expiration)} ${link(c.deal_id, c.company_name || c.dealname)} \u2014 ${tag} \u00b7 ends ${c.contract_end_date} \u00b7 ${money(c.arr)} ARR\\n      ${renewalLabel(c)}${extra}`;\n    });\n    if (grp.rows.length > maxItems) rows.push(`_+${grp.rows.length - maxItems} more in the audit log_`);\n    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`*:bust_in_silhouette: ${grp.name}*${k !== 'unassigned' ? ` (owner \\`${k}\\`)` : ''} \u2014 ${grp.rows.length} contract(s) \u00b7 ${money(arr)} ARR\\n${rows.join('\\n')}`) } });\n  }\n}\n\nif (run.dataQuality.length) {\n  blocks.push({ type: 'divider' });\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: truncate(`*:mag: Data quality*\\n${run.dataQuality.slice(0, maxItems).map((q) => `\u2022 Deal ${link(q.deal_id, `#${q.deal_id}`)}: ${q.issue}`).join('\\n')}`) } });\n}\n\nconst footer = mode === 'LIVE' ? 'Changes were written to HubSpot. Review the audit log for per-batch results.' : 'Preview only \u2014 nothing was written to HubSpot.';\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `${footer}  \u00b7  n8n-renewal-forecast-contract-expiration-radar v${run.workflowVersion}` }] });\n\nconst meets = SEV[severity] >= SEV[cfg.alerts.minSeverity];\nconst dispatch = { severity, meetsMinSeverity: meets, slack: gate.slackAlertsPermitted === true && meets, webhook: gate.webhookAlertsPermitted === true && meets };\n\nconst webhookEvent = {\n  event: 'crm.renewal_radar.run_completed',\n  run_id: run.runId,\n  severity,\n  mode,\n  data_source: run.dataSource,\n  radar_date: run.referenceDate,\n  circuit_breaker: { tripped: cb.tripped, reasons: cb.reasons },\n  stats,\n  forecast,\n  write_summary: run.writeSummary,\n  contracts: actionable.map((c) => ({\n    source_deal_id: c.deal_id, company_id: c.company_id, days_until_expiration: c.days_until_expiration, contract_end_date: c.contract_end_date,\n    arr: c.arr, milestone: c.milestone, status: c.status, owner_id: c.renewal_owner_id,\n    renewal_deal_id: (c.existing_renewal && c.existing_renewal.deal_id) || createdByKey[c.idempotency_key] || null,\n  })),\n};\n\nreturn [{\n  json: {\n    ...run,\n    alerts: { dispatch, slackPayload: { text: `[${severity}] Renewal radar ${run.runId}: ${actionable.length} contract(s) need action, ${money(stats.arr_without_renewal_deal)} ARR without a renewal deal. Mode ${mode}.`, blocks: blocks.slice(0, 50) }, webhookEvent },\n  },\n}];\n"
+      },
+      "id": "4dc8590e-f39e-5544-ae77-66aae479cced",
+      "name": "Build RevOps Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c7d0ad36-9130-59d9-bcb4-2150678b3c2e",
+              "leftValue": "={{ $json.alerts.dispatch.slack }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ac8f29a4-68de-57a6-ae8a-d062a7a66fe7",
+      "name": "Send Slack Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_RENEWAL_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.alerts.slackPayload) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "667cb72f-bab8-5c56-8673-7d6adef86ae4",
+      "name": "Post Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4400,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "b0a69e61-e4e7-59ba-bdd8-508ad0de59b2",
+              "leftValue": "={{ $('Build RevOps Alerts').first().json.alerts.dispatch.webhook }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "648b7208-cb12-57af-9ea9-1c2d7d71bc31",
+      "name": "Send Webhook Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ALERT_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Run-Id",
+              "value": "={{ $('Build RevOps Alerts').first().json.runId }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build RevOps Alerts').first().json.alerts.webhookEvent) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "57db0460-2e16-54b3-a350-10a5cc1bdcca",
+      "name": "Post Alert Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4880,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Execution Summary & Audit\n// One structured audit record per run. Send it to your log store,\n// warehouse or a HubSpot custom object for a durable trail.\n// =====================================================================\nconst run = $('Build RevOps Alerts').first().json;\nconst dispatchStatus = (nodeName, wanted) => {\n  if (!wanted) return 'NOT_SENT';\n  try {\n    if (!$(nodeName).isExecuted) return 'NOT_SENT';\n    const j = $(nodeName).first().json || {};\n    return j.error ? `FAILED: ${String(j.error.message || j.error).slice(0, 200)}` : 'SENT';\n  } catch (e) { return 'UNKNOWN'; }\n};\nconst finishedAt = new Date().toISOString();\n\nreturn [{\n  json: {\n    audit: {\n      run_id: run.runId,\n      workflow: run.workflow,\n      workflow_version: run.workflowVersion,\n      trigger: run.trigger,\n      started_at: run.startedAt,\n      finished_at: finishedAt,\n      duration_ms: Date.parse(finishedAt) - Date.parse(run.startedAt),\n      data_source: run.dataSource,\n      radar_reference_date: run.referenceDate,\n      radar_reference_date_source: run.config.radar.referenceDateSource,\n      safety: {\n        mode: run.gate.mode,\n        sandbox_mode: run.gate.sandboxMode,\n        dry_run: run.gate.dryRun,\n        permissions: run.gate.permissions,\n        mapping_explicit: run.gate.mappingExplicit,\n        write_mode: run.writeSummary.mode,\n        circuit_breaker: run.circuitBreaker,\n        gate_reasons: run.gate.reasons,\n        config_warnings: run.gate.warnings,\n        config_errors: run.gate.configErrors,\n      },\n      stats: run.stats,\n      forecast: run.forecast,\n      write_summary: run.writeSummary,\n      write_results: run.writeResults.map(({ would_send, ...r }) => r),\n      alerts: {\n        severity: run.alerts.dispatch.severity,\n        slack: dispatchStatus('Post Slack Alert', run.alerts.dispatch.slack),\n        webhook: dispatchStatus('Post Alert Webhook', run.alerts.dispatch.webhook),\n      },\n      contract_decisions: run.contracts.map((c) => ({\n        source_deal_id: c.deal_id,\n        company_id: c.company_id,\n        contract_end_date: c.contract_end_date,\n        days_until_expiration: c.days_until_expiration,\n        arr: c.arr,\n        status: c.status,\n        milestone: c.milestone || null,\n        provision_reason: c.provision_reason || null,\n        duplicate_prevented: c.duplicate_prevented || null,\n        existing_renewal_deal_id: c.existing_renewal ? c.existing_renewal.deal_id : null,\n        created_renewal_deal_id: (run.createdRenewals || {})[c.idempotency_key] || null,\n        stage_update: c.stage_update || null,\n        renewal_owner_id: c.renewal_owner_id || null,\n        owner_fallback_used: Boolean(c.owner_fallback_used),\n        notes: c.notes,\n      })),\n      data_quality: run.dataQuality,\n      fetch_warnings: run.fetchWarnings,\n      rules_snapshot: { radar: run.config.radar, limits: run.config.limits, stage_map: run.config.hubspot.stageMap, renewal_pipeline_id: run.config.hubspot.renewalPipelineId },\n    },\n  },\n}];\n"
+      },
+      "id": "d1170a5f-9fdf-58e4-b7b1-4cb9185824ed",
+      "name": "Execution Summary & Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Safe by default\nImported as-is this workflow makes **zero network calls** and writes nothing to HubSpot.\n\n- `SANDBOX_MODE=true` \u2192 mock fixture only\n- `DRY_RUN=true` \u2192 no writes\n- `RENEWAL_DEALS_CREATION_ENABLED=false`\n- `RENEWAL_STAGE_UPDATES_ENABLED=false`\n- `MILESTONE_WRITEBACK_ENABLED=false`\n- `SEND_SLACK_ALERTS=false`\n\nLive writes also need a token, an explicit renewal pipeline + stage mapping, and an untripped circuit breaker.",
+        "height": 420,
+        "width": 460,
+        "color": 4
+      },
+      "id": "0d21816e-95eb-58cb-9a7f-710d0ced5d59",
+      "name": "Note: Safe by Default",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Live HubSpot reads\nDeals search (paginated) \u2192 existing renewals search \u2192 v4 deal\u2192company associations \u2192 companies batch read \u2192 active owners.\n\nAll read-only; any search failure halts the run.",
+        "height": 200,
+        "width": 760,
+        "color": 7
+      },
+      "id": "8836fe37-38ee-52e9-b0ad-14e037405cc8",
+      "name": "Note: Live Reads",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        700,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Radar & provisioning\nMilestones: exact 90/60/30 days (catch-up only with write-back).\nProvisioning: any enterprise contract \u226490d with no renewal deal.\nDuplicate guards: source ID \u2192 idempotency key \u2192 company association \u2192 in-run.",
+        "height": 280,
+        "width": 420,
+        "color": 5
+      },
+      "id": "02b8458f-74d6-5d11-938f-73e252e3ffae",
+      "name": "Note: Engine",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2640,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## HubSpot writes\n`Split HubSpot Operations` re-checks every flag and throws if any disagree. Creates run first, one batch per second, **no automatic retry** (a retried create could duplicate).",
+        "height": 240,
+        "width": 560,
+        "color": 3
+      },
+      "id": "ca541e8c-38b5-5099-87df-7fbdd7beee02",
+      "name": "Note: Writes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3160,
+        -120
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 08:00 UTC Schedule": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Safety Gate": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Load Mock Fixture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Expiring Deals (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Mock Fixture": {
+      "main": [
+        [
+          {
+            "node": "Renewal Radar & Provisioning Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Expiring Deals (Live)": {
+      "main": [
+        [
+          {
+            "node": "Search Existing Renewals (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Existing Renewals (Live)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Association Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Association Batches": {
+      "main": [
+        [
+          {
+            "node": "Has Deals To Enrich?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Deals To Enrich?": {
+      "main": [
+        [
+          {
+            "node": "Read Deal-Company Associations (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize Live HubSpot Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Deal-Company Associations (Live)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Company Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Company Batches": {
+      "main": [
+        [
+          {
+            "node": "Read Companies (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Companies (Live)": {
+      "main": [
+        [
+          {
+            "node": "Get Active Owners (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Active Owners (Live)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Live HubSpot Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Live HubSpot Data": {
+      "main": [
+        [
+          {
+            "node": "Renewal Radar & Provisioning Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Renewal Radar & Provisioning Engine": {
+      "main": [
+        [
+          {
+            "node": "Live Writes Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Writes Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Split HubSpot Operations",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dry-Run HubSpot Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split HubSpot Operations": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Batch Create / Update (Live)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Batch Create / Update (Live)": {
+      "main": [
+        [
+          {
+            "node": "Collect HubSpot Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect HubSpot Results": {
+      "main": [
+        [
+          {
+            "node": "Build RevOps Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry-Run HubSpot Preview": {
+      "main": [
+        [
+          {
+            "node": "Build RevOps Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build RevOps Alerts": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Alert?": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Webhook Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Webhook Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Webhook Alert?": {
+      "main": [
+        [
+          {
+            "node": "Post Alert Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Execution Summary & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Execution Summary & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
