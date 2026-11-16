@@ -1,0 +1,611 @@
+{
+  "fixture_meta": {
+    "fixture_version": "1.0.0",
+    "description": "Sanitized, fully synthetic HubSpot-shaped deals, companies, associations and owners for SANDBOX_MODE. Every ID, name, domain, amount and date in this file is fictional.",
+    "synthetic": true,
+    "contains_real_data": false,
+    "portal_id": "99000001",
+    "as_of": "2026-11-16",
+    "source_pipeline_id": "default",
+    "source_closed_won_stage_id": "closedwon",
+    "renewal_pipeline_id": "880001",
+    "renewal_stage_ids": {
+      "90": "880001-identified",
+      "60": "880001-proposal",
+      "30": "880001-commit"
+    },
+    "renewal_closed_stage_ids": [
+      "880001-won",
+      "880001-lost"
+    ]
+  },
+  "deals_search_results": {
+    "total": 9,
+    "results": [
+      {
+        "id": "66001",
+        "properties": {
+          "hs_object_id": "66001",
+          "dealname": "Apex Global Tech - Enterprise Platform 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "240000",
+          "arr": "240000",
+          "contract_end_date": "2027-02-14",
+          "hubspot_owner_id": "70000001",
+          "renewal_radar_last_milestone": null,
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66002",
+        "properties": {
+          "hs_object_id": "66002",
+          "dealname": "Vanguard Enterprise - Core Subscription 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "180000",
+          "arr": "180000",
+          "contract_end_date": "2027-01-15",
+          "hubspot_owner_id": "70000002",
+          "renewal_radar_last_milestone": "90",
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66003",
+        "properties": {
+          "hs_object_id": "66003",
+          "dealname": "Northwind Example Systems - Global License 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "420000",
+          "arr": "420000",
+          "contract_end_date": "2026-12-16T00:00:00.000Z",
+          "hubspot_owner_id": "70000003",
+          "renewal_radar_last_milestone": null,
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66004",
+        "properties": {
+          "hs_object_id": "66004",
+          "dealname": "Orion Data Example Corp - Analytics Suite 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "95000",
+          "arr": "95000",
+          "contract_end_date": "2027-02-13",
+          "hubspot_owner_id": "70000001",
+          "renewal_radar_last_milestone": null,
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66005",
+        "properties": {
+          "hs_object_id": "66005",
+          "dealname": "Summit Example Holdings - Starter Plan 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "30000",
+          "arr": "30000",
+          "contract_end_date": "2027-01-15",
+          "hubspot_owner_id": "70000002",
+          "renewal_radar_last_milestone": null,
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66006",
+        "properties": {
+          "hs_object_id": "66006",
+          "dealname": "Apex Global Tech - Analytics Add-on 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "60000",
+          "arr": "60000",
+          "contract_end_date": "2027-03-20",
+          "hubspot_owner_id": "70000001",
+          "renewal_radar_last_milestone": null,
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66007",
+        "properties": {
+          "hs_object_id": "66007",
+          "dealname": "Vanguard Enterprise - EMEA Expansion 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "130000",
+          "arr": "130000",
+          "contract_end_date": "1800057600000",
+          "hubspot_owner_id": "70000002",
+          "renewal_radar_last_milestone": null,
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66008",
+        "properties": {
+          "hs_object_id": "66008",
+          "dealname": "Northwind Example Systems - Platform License 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "150000",
+          "arr": "150000",
+          "contract_end_date": "2027-02-14",
+          "hubspot_owner_id": "70000002",
+          "renewal_radar_last_milestone": null,
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66009",
+        "properties": {
+          "hs_object_id": "66009",
+          "dealname": "Orion Data Example Corp - Data Connectors 2025",
+          "pipeline": "default",
+          "dealstage": "closedwon",
+          "amount": "72000",
+          "arr": "72000",
+          "contract_end_date": "TBD",
+          "hubspot_owner_id": "70000001",
+          "renewal_radar_last_milestone": null,
+          "closedate": "2025-11-20T00:00:00.000Z"
+        },
+        "createdAt": "2025-10-01T09:00:00.000Z",
+        "updatedAt": "2026-11-01T09:00:00.000Z",
+        "archived": false
+      }
+    ],
+    "paging": null
+  },
+  "renewal_deals_search_results": {
+    "total": 3,
+    "results": [
+      {
+        "id": "66102",
+        "properties": {
+          "hs_object_id": "66102",
+          "dealname": "Vanguard Enterprise - Renewal 2027",
+          "pipeline": "880001",
+          "dealstage": "880001-identified",
+          "amount": null,
+          "closedate": "2027-01-15T00:00:00.000Z",
+          "contract_end_date": "2027-01-15",
+          "hubspot_owner_id": "70000002",
+          "renewal_source_deal_id": "66002",
+          "renewal_idempotency_key": "renewal-66002-2027-01-15"
+        },
+        "createdAt": "2026-10-17T08:00:00.000Z",
+        "updatedAt": "2026-10-17T08:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66107",
+        "properties": {
+          "hs_object_id": "66107",
+          "dealname": "Vanguard EMEA renewal (created manually)",
+          "pipeline": "880001",
+          "dealstage": "880001-identified",
+          "amount": null,
+          "closedate": "2027-01-20T00:00:00.000Z",
+          "contract_end_date": null,
+          "hubspot_owner_id": "70000002",
+          "renewal_source_deal_id": null,
+          "renewal_idempotency_key": null
+        },
+        "createdAt": "2026-10-17T08:00:00.000Z",
+        "updatedAt": "2026-10-17T08:00:00.000Z",
+        "archived": false
+      },
+      {
+        "id": "66108",
+        "properties": {
+          "hs_object_id": "66108",
+          "dealname": "Northwind Example Systems - Renewal 2027",
+          "pipeline": "880001",
+          "dealstage": "880001-identified",
+          "amount": null,
+          "closedate": "2027-02-14T00:00:00.000Z",
+          "contract_end_date": "2027-02-14",
+          "hubspot_owner_id": "70000002",
+          "renewal_source_deal_id": null,
+          "renewal_idempotency_key": "renewal-66008-2027-02-14"
+        },
+        "createdAt": "2026-10-17T08:00:00.000Z",
+        "updatedAt": "2026-10-17T08:00:00.000Z",
+        "archived": false
+      }
+    ],
+    "paging": null
+  },
+  "deal_company_associations": {
+    "status": "COMPLETE",
+    "results": [
+      {
+        "from": {
+          "id": "66001"
+        },
+        "to": [
+          {
+            "toObjectId": 55001,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66002"
+        },
+        "to": [
+          {
+            "toObjectId": 55002,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66003"
+        },
+        "to": [
+          {
+            "toObjectId": 55003,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66004"
+        },
+        "to": [
+          {
+            "toObjectId": 55004,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66005"
+        },
+        "to": [
+          {
+            "toObjectId": 55005,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66006"
+        },
+        "to": [
+          {
+            "toObjectId": 55001,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66007"
+        },
+        "to": [
+          {
+            "toObjectId": 55002,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66008"
+        },
+        "to": [
+          {
+            "toObjectId": 55003,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66009"
+        },
+        "to": [
+          {
+            "toObjectId": 55004,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66102"
+        },
+        "to": [
+          {
+            "toObjectId": 55002,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66107"
+        },
+        "to": [
+          {
+            "toObjectId": 55002,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "from": {
+          "id": "66108"
+        },
+        "to": [
+          {
+            "toObjectId": 55003,
+            "associationTypes": [
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 5,
+                "label": "Primary"
+              },
+              {
+                "category": "HUBSPOT_DEFINED",
+                "typeId": 341,
+                "label": null
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "companies_batch_read": {
+    "status": "COMPLETE",
+    "results": [
+      {
+        "id": "55001",
+        "properties": {
+          "hs_object_id": "55001",
+          "name": "Apex Global Tech",
+          "domain": "apexglobaltech.example.com",
+          "customer_tier": "Enterprise"
+        },
+        "archived": false
+      },
+      {
+        "id": "55002",
+        "properties": {
+          "hs_object_id": "55002",
+          "name": "Vanguard Enterprise",
+          "domain": "vanguard-enterprise.example.com",
+          "customer_tier": "Enterprise"
+        },
+        "archived": false
+      },
+      {
+        "id": "55003",
+        "properties": {
+          "hs_object_id": "55003",
+          "name": "Northwind Example Systems",
+          "domain": "northwind-systems.example.com",
+          "customer_tier": "Strategic"
+        },
+        "archived": false
+      },
+      {
+        "id": "55004",
+        "properties": {
+          "hs_object_id": "55004",
+          "name": "Orion Data Example Corp",
+          "domain": "orion-data.example.com",
+          "customer_tier": "Enterprise"
+        },
+        "archived": false
+      },
+      {
+        "id": "55005",
+        "properties": {
+          "hs_object_id": "55005",
+          "name": "Summit Example Holdings",
+          "domain": "summit-holdings.example.com",
+          "customer_tier": "Mid-Market"
+        },
+        "archived": false
+      }
+    ]
+  },
+  "owners": {
+    "results": [
+      {
+        "id": "70000001",
+        "email": "ava.example@example.com",
+        "firstName": "Ava",
+        "lastName": "Example",
+        "userId": 81000001,
+        "archived": false
+      },
+      {
+        "id": "70000002",
+        "email": "ben.sample@example.com",
+        "firstName": "Ben",
+        "lastName": "Sample",
+        "userId": 81000002,
+        "archived": false
+      },
+      {
+        "id": "70000003",
+        "email": "cara.placeholder@example.com",
+        "firstName": "Cara",
+        "lastName": "Placeholder",
+        "userId": 81000003,
+        "archived": true
+      },
+      {
+        "id": "70000099",
+        "email": "renewals-desk@example.com",
+        "firstName": "Renewals",
+        "lastName": "Desk",
+        "userId": 81000099,
+        "archived": false
+      }
+    ],
+    "paging": null
+  }
+}
