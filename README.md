@@ -31,6 +31,8 @@ It is **safe by default**. Imported as-is, it reads a synthetic fixture, makes *
 
 ## 1. Architecture overview
 
+![Renewal Forecast - Contract Expiration Radar Workflow Overview](workflow-overview.png)
+
 | Stage | Node(s) | Purpose |
 |---|---|---|
 | Triggers | `Daily 08:00 UTC Schedule`, `Manual Test Trigger` | Daily cron (`0 8 * * *`, workflow timezone UTC) or an on-demand test run |
